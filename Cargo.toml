@@ -1,0 +1,15 @@
+[package]
+name= "p2p-tor-chat"
+version= "0.1.0"
+authors= ["monika"]
+edition= "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+#web-view= {git= "https://github.com/diagonalisability/web-view"}
+torut= "0.1.7"
+tokio= { version= "0.3.5", features= ["net","macros","rt-multi-thread"] }
+gtk= "0.9.2"
+glib= "0.10.3"
+reqwest= "0.9.18"
