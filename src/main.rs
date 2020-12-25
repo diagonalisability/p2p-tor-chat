@@ -3,6 +3,48 @@ enum Message {
 	PeerMessage(String/*sender*/,String/*body*/)
 }
 const SOCKS_PORT:u32= 30001;
+struct TorChild {
+	process: std::process::Child
+}
+impl TorChild {
+	fn new()->TorChild { println!("starting tor"); TorChild { process:
+		std::process::Command::new("tor")
+			.args(&[
+				"-f","torrc",
+				"ControlPort", "10001",
+				"DisableNetwork", "1",
+				"SocksPort", &SOCKS_PORT.to_string(),
+				"CookieAuthentication","1",
+				"CookieAuthFile","cookie",
+				"Log","info file log",
+			])
+			.stdout(std::process::Stdio::piped())
+			.current_dir("tor")
+			.spawn()
+			.unwrap()
+	}}
+	fn wait_for_ready(&mut self) {
+		use std::io::BufRead;
+		let stdout= self.process.stdout.take().unwrap();
+		for line in std::io::BufReader::new(stdout).lines() {
+			let line= line.unwrap();
+			println!("{}",line);
+			if line.contains("Opened Control listener") {
+				println!("tor is now ready");
+				return;
+			}
+		}
+	}
+}
+impl Drop for TorChild {
+	fn drop(&mut self) {
+		println!("dropping tor");
+		std::process::Command::new("kill") // sends sigterm
+			.args(&[&format!("{}",self.process.id())])
+			.status()
+			.unwrap();
+	}
+}
 fn connect_to_peer() {
 	use gtk::prelude::*;
 	let glade_src= std::fs::read_to_string("peer-connect.glade").unwrap();
@@ -19,8 +61,7 @@ fn connect_to_peer() {
 }
 fn run_gtk(
 	receiver:glib::Receiver<Message>,
-	lock:std::sync::Weak<std::sync::Mutex<std::option::Option<String>>>,
-	cv:std::sync::Arc<std::sync::Condvar>
+	profile_dir_sender:tokio::sync::oneshot::Sender<String> 
 ) {
 	use gtk::prelude::*;
 	gtk::init().unwrap();
@@ -32,13 +73,14 @@ fn run_gtk(
 		let button:gtk::Button= builder.get_object("button0").unwrap();
 		let entry:gtk::Entry= builder.get_object("textfield0").unwrap();
 		{
-			let window_c= window.clone();
-			button.connect_clicked(move/*entry*/|_but| {
-				*(*lock.upgrade().unwrap()).lock().unwrap()= Some(entry.get_buffer().get_text());
-				window_c.close();
-				(*cv).notify_one(); // notify the original thread
+			// this is horrible but it works
+			let profile_dir_sender= std::rc::Rc::new(std::cell::Cell::new(Some(profile_dir_sender)));
+			let window= window.clone();
+			button.connect_clicked(move |_but| {
+				profile_dir_sender.take().unwrap().send(entry.get_buffer().get_text()).unwrap();
 				println!("profile selected, moving on with gui");
 				connect_to_peer();
+				window.close();
 			});
 		}
 		window.show_all();
@@ -60,26 +102,13 @@ fn run_gtk(
 #[tokio::main] // check size
 async fn main() {
 	let (profile_dir,sender,gtk_thread)= {
-		use std::sync::{Arc,Mutex,Condvar};
-		use std::option::Option;
 		// https://doc.rust-lang.org/std/sync/struct.Condvar.html
-		let (sender,receiver)= glib::MainContext::channel(glib::PRIORITY_DEFAULT);
-		let lock= Arc::new(Mutex::new(Option::<String>::None));
-		let cv= Arc::new(Condvar::new());
-		let gtk_thread= {
-			let lock_c= Arc::<Mutex<Option<std::string::String>>>::downgrade(&lock);
-			let cv_c= cv.clone();
-			std::thread::spawn(move||{run_gtk(receiver,lock_c,cv_c)})
-		};
-		{
-			let mut guard= (*lock).lock().unwrap();
-			while !(1==Arc::<Mutex<Option<String>>>::strong_count(&lock) && (*guard).is_some()) {
-				guard= (*cv).wait(guard).unwrap();
-			};
-		}
+		let (msg_sender,msg_receiver)= glib::MainContext::channel(glib::PRIORITY_DEFAULT);
+		let (profile_dir_sender,profile_dir_receiver)= tokio::sync::oneshot::channel();
+		let gtk_thread= std::thread::spawn(move||{run_gtk(msg_receiver,profile_dir_sender)});
 		(
-			Arc::<Mutex<Option<String>>>::try_unwrap(lock).unwrap().into_inner().unwrap().unwrap(),
-			sender,
+			profile_dir_receiver.await.unwrap(),
+			msg_sender,
 			gtk_thread
 		)
 	};
@@ -110,22 +139,9 @@ async fn main() {
 	// https://github.com/teawithsand/torut/blob/master/examples/cookie_authenticate.rs
 	// https://comit.network/blog/2020/07/02/tor-poc/
 	println!("start tor");
-	let tor_pid= std::process::Command::new("tor")
-		.args(&[
-			"-f","torrc",
-			"ControlPort", "10001",
-			"DisableNetwork", "1",
-			"SocksPort", &format!("{}",SOCKS_PORT),
-			"CookieAuthentication","1",
-			"CookieAuthFile","cookie",
-//			"Log","debug",
-		])
-		.current_dir("tor")
-		.spawn()
-		.unwrap()
-		.id();
-	// give tor time to start, otherwise we won't be able to connect (this is a hack)
-	std::thread::sleep(std::time::Duration::from_millis(1000));
+
+	let mut tor_child= TorChild::new();
+	tor_child.wait_for_ready();
 	println!("tor started");
 	let socket= tokio::net::TcpStream::connect("127.0.0.1:10001").await.unwrap();
 	println!("connected to control port");
@@ -178,66 +194,5 @@ async fn main() {
 			}
 		});
 	}});
-
-//	do_webview(receiver);
 	gtk_thread.join().unwrap();
-	println!("kill tor");
-	std::process::Command::new("kill")
-		.args(&[&format!("{}",tor_pid)])
-		.status()
-		.unwrap();
 }
-/*
-fn do_webview(msg_receiver:std::sync::mpsc::Receiver<String>) {
-	let html= "<html>
-		<body>
-			<button onclick=external.invoke('signal')>hi!</button>
-		</body>
-	</html>";
-	let mut wv= web_view::builder()
-		.content(web_view::Content::Html(html))
-		.user_data(())
-		.size(40,40)
-		.invoke_handler(|wv, arg| {
-			println!("got arg: {}",arg);
-			wv.eval("
-				{
-					const div= document.createElement('div');
-					div.innerHTML= 'hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello hello';
-					div.classList.add('message');
-					document.body.appendChild(div);
-				}
-			").unwrap();
-			Ok(())
-		})
-		.build()
-		.unwrap();
-	wv.inject_css("
-		button {
-			background-color: #73AD21;
-			padding: 2mm;
-			color: #ffffff;
-			border: 0;
-			border-radius:1mm;
-		}
-		body > * {		
-			display: block;
-		}
-		.message {
-			border-radius:1mm;
-			margin: 4mm;
-			padding: 1mm;
-			background-color: #ffff00;
-		}
-	").unwrap();
-	//std::thread::sleep(std::time::Duration::from_millis(10000000));
-	//return;
-	wv.run();
-//	while !wv.step().is_none() {}
-	println!("we're done here");
-	loop {
-		let msg= msg_receiver.recv().unwrap();
-		println!("got message!: {}",msg);
-	}
-}
-*/
