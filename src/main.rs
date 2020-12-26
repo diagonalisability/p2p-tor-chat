@@ -5,9 +5,21 @@ enum Message {
 struct TorChild {
 	process: std::process::Child,
 	stdout_lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
+	acon: torut::control::AuthenticatedConn<
+		tokio::net::UnixStream,
+		fn(torut::control::AsyncEvent<'static>)->DummyFuture>
+}
+// torut never needs this, but the AuthenticatedConn struct has a weird type parameter
+// which this is used to fix.
+struct DummyFuture {}
+impl std::future::Future for DummyFuture {
+	type Output= Result<(),torut::control::ConnError>;
+	fn poll(self:std::pin::Pin<&mut Self>,cx:&mut std::task::Context<'_>)->std::task::Poll<Self::Output> {
+		panic!("this way i don't need to return anything");
+	}
 }
 impl TorChild {
-	fn new(profile_dir:&String,torrc:&String)->TorChild {
+	async fn new(profile_dir:&String,torrc:&String)->TorChild {
 		println!("starting tor, logging to {}/log",profile_dir);
 		let mut process= std::process::Command::new("tor")
 			.args(&[
@@ -27,22 +39,49 @@ impl TorChild {
 			.unwrap();
 		use std::io::BufRead;
 		let stdout= process.stdout.take().unwrap();
+		let mut lines= std::io::BufReader::new(stdout).lines();
+		Self::wait_for_ready(&mut lines);
+		let mut ucon;
+		{
+			use tokio::net::UnixStream;
+			let unix= UnixStream::connect(format!("{}/control-socket",profile_dir)).await.unwrap();
+			ucon= torut::control::UnauthenticatedConn::new(unix);
+		}
+		println!("created connection");
+		let proto_info= ucon.load_protocol_info().await.unwrap();
+		let auth_data= proto_info.make_auth_data().unwrap().unwrap();
+		ucon.authenticate(&auth_data).await.unwrap();
+		let mut acon= ucon.into_authenticated().await;
+		acon.take_ownership().await.unwrap();
 		TorChild {
 			process: process,
-			stdout_lines: std::io::BufReader::new(stdout).lines()
+			stdout_lines: lines,
+			acon: acon,
 		}
 	}
-	fn wait_for_ready(&mut self) {
+	fn wait_for_ready(lines:&mut std::io::Lines<std::io::BufReader<std::process::ChildStdout>>) {
 		use std::io::BufRead;
 		loop {
-			if self.stdout_lines.next().unwrap().unwrap().contains("Opened Control listener") {
+			if lines.next().unwrap().unwrap().contains("Opened Control listener") {
 				println!("control listener open");
 				return;
 			}
 		}
 	}
-	// call this after enabling network
-	fn get_socks_port(&mut self)->u32 {
+	async fn make_onion_listener(&mut self,key:torut::onion::TorSecretKeyV3)->std::net::TcpListener {
+		let listener= std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let port= listener.local_addr().unwrap().port();
+		println!("the OS gave us port {}",port);
+		self.acon.add_onion_v3(&key,false,false,false,Some(0),&mut[
+			(20001,std::net::SocketAddr::new(std::net::IpAddr::from(std::net::Ipv4Addr::new(127,0,0,1)),port))
+		].iter()).await.unwrap();
+		println!("using onion address {}",key.public().get_onion_address());
+		listener
+	}
+	// returns socks port
+	async fn enable_network(&mut self)->u32 {
+		self.acon.set_conf("DisableNetwork",Some("0")).await.unwrap();
+		println!("getting socks port");
 		use std::io::BufRead;
 		loop {
 			let line= self.stdout_lines.next().unwrap().unwrap();
@@ -51,7 +90,7 @@ impl TorChild {
 				println!("socks port: {}",port);
 				return port;
 			}
-		}
+		}	
 	}
 }
 impl Drop for TorChild {
@@ -78,7 +117,7 @@ fn connect_to_peer(socks_port:u32) {
 			format!("{}:20001",entry.get_buffer().get_text().as_str()).as_str()
 		).unwrap();
 		println!("connected!");
-		std::io::Write::write(&mut stream,b"asdfasdfasdf\nbob\nhello, there!\nquit\n");
+		std::io::Write::write(&mut stream,b"asdfasdfasdf\nbob\nhello, there!\nquit\n").unwrap();
 		let reader= std::io::BufReader::new(stream);
 		use std::io::BufRead;
 		println!("waiting for response");
@@ -185,39 +224,10 @@ async fn main() {
 	// https://github.com/teawithsand/torut/blob/master/examples/cookie_authenticate.rs
 	// https://comit.network/blog/2020/07/02/tor-poc/
 	println!("start tor");
-	let mut tor_child= TorChild::new(&profile_dir,&format!("{}/torrc",cur_dir));
-	let socks_port= tor_child.wait_for_ready();
+	let mut tor_child= TorChild::new(&profile_dir,&format!("{}/torrc",cur_dir)).await;
+	let socks_port= tor_child.enable_network().await;
 	println!("connected to control port");
-	let mut ucon;
-	{
-		use tokio::net::UnixStream;
-		let unix= UnixStream::connect(format!("{}/control-socket",profile_dir)).await.unwrap();
-		ucon= torut::control::UnauthenticatedConn::new(unix);
-	}
-	println!("created connection");
-	let proto_info= ucon.load_protocol_info().await.unwrap();
-//	assert!(proto_info.auth_methods.contains(&torut::control::TorAuthMethod::Cookie), "Null authentication is not allowed");
-	let auth_data= proto_info.make_auth_data().unwrap().unwrap();
-	ucon.authenticate(&auth_data).await.unwrap();
-	let mut acon= ucon.into_authenticated().await;
-	if false {
-		// if you take out this statement, some super weird type inference
-		// that this library authour was depending on fails to occur and the call to
-		// into_authenticated fails because of an unknown type
-		acon.set_async_event_handler(Some(|_| { async move { Ok(()) } }));
-		//let _socksport = acon.get_info_unquote("net/listeners/socks").await.unwrap();
-	}
-	let listener= std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-	let port= listener.local_addr().unwrap().port();
-	println!("the OS gave us port {}",port);
-	acon.add_onion_v3(&onion_key,false,false,false,Some(0),&mut[
-		(20001,std::net::SocketAddr::new(std::net::IpAddr::from(std::net::Ipv4Addr::new(127,0,0,1)),port))
-	].iter()).await.unwrap();
-	println!("using onion address {}",onion_key.public().get_onion_address());
-	acon.set_conf("DisableNetwork",Some("0")).await.unwrap();
-
-	println!("getting socks port");
-	let socks_port= tor_child.get_socks_port();
+	let listener= tor_child.make_onion_listener(onion_key).await;
 	socks_port_sender.send(socks_port).unwrap();
 
 	let (sender,receiver)= std::sync::mpsc::channel::<String>();
