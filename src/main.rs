@@ -133,12 +133,18 @@ impl Drop for TorChild {
 			.unwrap();
 	}
 }
-fn open_chat() {
-	use gtk::prelude::*;
-	let glade_src= std::fs::read_to_string("chat.glade").unwrap();
-	let builder= gtk::Builder::from_string(&glade_src);
-	let window:gtk::Window= builder.get_object("window").unwrap();
-	window.show_all();
+// called from non-gtk thread
+fn open_chat(stream:std::net::TcpStream) {
+	let stream= std::sync::Arc::new(std::sync::Mutex::new(Some(stream)));
+	glib::source::idle_add(move||{
+		println!("opening chat");
+		let stream= stream.lock().unwrap().take().unwrap();
+		let builder= open_glade("chat.glade");
+		use gtk::prelude::*;
+		let window:gtk::Window= builder.get_object("window").unwrap();
+		window.show_all();
+		glib::Continue(false)
+	});
 }
 fn connect_to_peer(socks_port:u32,thread_pool:GrowingThreadPool) {
 	use gtk::prelude::*;
@@ -153,20 +159,17 @@ fn connect_to_peer(socks_port:u32,thread_pool:GrowingThreadPool) {
 	//	let entry_text= std::rc::Rc::new(std::cell::Cell::new(entry.get_buffer().get_text()));
 		println!("button clicked with entry text '{}'",entry_text);
 		window_c.close();
-		open_chat();
+//		open_chat();
 		thread_pool.take().unwrap().execute(move||{
 			//connect_with_address(entry.get_buffer().get_text());
 			println!("connecting to {}",entry_text);
 			let mut stream= socks::Socks5Stream::connect(
 				format!("127.0.0.1:{}",socks_port),
 				format!("{}:20001",entry_text).as_str(),
-			).unwrap();
+			).unwrap().into_inner();
 			println!("connected!");
-			std::io::Write::write(&mut stream,b"asdfasdfasdf\nbob\nhello, there!\nquit\n").unwrap();
-			let reader= std::io::BufReader::new(stream);
-			use std::io::BufRead;
-			println!("waiting for response");
-			println!("got response: {}",reader.lines().next().unwrap().unwrap());
+			std::io::Write::write(&mut stream,b"asdfasdfasdf\nbob\n").unwrap();
+			open_chat(stream);
 			// https://docs.rs/reqwest/0.10.9/reqwest/struct.Proxy.html
 			//let client= reqwest::Client::builder()
 			//	.proxy(reqwest::Proxy::all(&format!("socks5://127.0.0.1:{}",SOCKS_PORT)).unwrap())
@@ -206,7 +209,8 @@ fn listen(listener:std::net::TcpListener,thread_pool:GrowingThreadPool) {
 		println!("got listen stream, queueing handle task");
 		thread_pool_c.execute(||{
 			println!("got a tor connection!");
-			let mut write_stream= stream.unwrap();
+			let gui_stream= stream.unwrap();
+			let write_stream= gui_stream.try_clone().unwrap();
 			let read_stream= write_stream.try_clone().unwrap();
 			let mut reader= std::io::BufReader::new(&read_stream);
 			let mut peer_id= String::new(); std::io::BufRead::read_line(&mut reader,&mut peer_id).unwrap(); let peer_id= peer_id.trim();
@@ -216,6 +220,8 @@ fn listen(listener:std::net::TcpListener,thread_pool:GrowingThreadPool) {
 			println!("peer authenticated");
 			let mut nick= String::new(); std::io::BufRead::read_line(&mut reader,&mut nick).unwrap(); let nick= nick.trim();
 			println!("peer nickname: {}",nick);
+			open_chat(gui_stream);
+			/*
 			let mut line= String::new();
 			loop {
 				line.clear();
@@ -225,6 +231,7 @@ fn listen(listener:std::net::TcpListener,thread_pool:GrowingThreadPool) {
 				}
 				std::io::Write::write(&mut write_stream,b"hello!\n").unwrap();
 			}
+			*/
 		});
 	}});
 	println!("done listen");
@@ -256,6 +263,7 @@ fn do_menu(
 	let builder= open_glade("menu.glade");
 	let button:gtk::Button= builder.get_object("connect_button").unwrap();
 	let window:gtk::Window= builder.get_object("window").unwrap();
+	window.resize(300,100);
 	let thread_pool= std::rc::Rc::new(std::cell::RefCell::new(thread_pool));
 	button.connect_clicked(move|_but| {
 		connect_to_peer(socks_port,(*thread_pool).borrow().clone());
@@ -275,18 +283,6 @@ fn main() {
 		(*thread_pool_rc).take().unwrap(),
 		(*tor_child_tx).take().unwrap(),
 	);});
-/*	receiver.attach(
-		None/*use thread-default context*/,
-		|msg:Message| {
-			println!("got a message");
-			match msg {
-				Message::PeerMessage(sender,body)=> {
-					println!("{} says: {}",sender,body);
-				}
-			}
-			glib::Continue(true)
-		}
-	);*/
 	gtk::main();
 	// keep tor_child here for RAII when gtk::main unblocks
 	let _tor_child= rt.block_on(tor_child_rx);
