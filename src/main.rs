@@ -133,8 +133,18 @@ impl Drop for TorChild {
 			.unwrap();
 	}
 }
+fn make_gtk_label(text:&String)->gtk::Label {
+	use gtk::prelude::*;
+	let label= gtk::Label::new(Some(text));
+	label.set_halign(gtk::Align::Start);
+	label
+}
 // called from non-gtk thread
-fn open_chat(stream:std::net::TcpStream) {
+fn open_chat(
+	stream:std::net::TcpStream,
+	profile_name:std::sync::Arc<String>,
+	thread_pool:GrowingThreadPool
+) {
 	let stream= std::sync::Arc::new(std::sync::Mutex::new(Some(stream)));
 	glib::source::idle_add(move||{
 		println!("opening chat");
@@ -142,11 +152,62 @@ fn open_chat(stream:std::net::TcpStream) {
 		let builder= open_glade("chat.glade");
 		use gtk::prelude::*;
 		let window:gtk::Window= builder.get_object("window").unwrap();
+		let messages:gtk::ListBox= builder.get_object("messages").unwrap();
+		let entry:gtk::Entry= builder.get_object("entry").unwrap();
+		messages.add(&make_gtk_label(&format!("chat for profile: {}",profile_name)));
+		{
+			// TODO: fix this double-clone of stream here
+			let stream= stream.try_clone().unwrap();
+			let messages= messages.clone();
+			entry.connect_activate(move|entry|{
+				let mut stream= stream.try_clone().unwrap();
+				let buf= entry.get_buffer();
+				let message= buf.get_text();
+				buf.set_text("");
+				println!("message sent: '{}'",message);
+				let label= make_gtk_label(&format!("you: {}",message));
+				label.show();
+				messages.add(&label);
+				use std::io::Write;
+				stream.write(&(message+"\n").into_bytes()).unwrap();
+			});
+		}
 		window.show_all();
+		let (tx,rx)= glib::MainContext::channel(glib::PRIORITY_DEFAULT);
+		rx.attach(
+			None, // use default context
+			move|msg| {
+				println!("got message on the main thread: {}",msg);
+				let text= format!("peer: {}",msg);
+				let label= gtk::Label::new(Some(&text));
+				label.set_halign(gtk::Align::Start);
+				println!("adding label with text {}",text);
+				messages.add(&label);
+				label.show();
+				glib::Continue(true)
+			}
+		);
+		thread_pool.execute(move||{
+			let tx= tx.clone();
+			let read_stream= stream.try_clone().unwrap();
+			use std::io::BufRead;
+			for line in std::io::BufReader::new(read_stream).lines() {
+				let line= line.unwrap();
+				println!("got a line!: {}",line);
+				match tx.send(line) {
+					Ok(()) => (),
+					Err(err) => { println!("error sending: {}",err); }
+				};
+			}
+		});
 		glib::Continue(false)
 	});
 }
-fn connect_to_peer(socks_port:u32,thread_pool:GrowingThreadPool) {
+fn connect_to_peer(
+	socks_port:u32,
+	thread_pool:GrowingThreadPool,
+	profile_name:std::sync::Arc<String>
+) {
 	use gtk::prelude::*;
 	let builder= open_glade("peer-connect.glade");
 	let window:gtk::Window= builder.get_object("window0").unwrap();
@@ -154,13 +215,15 @@ fn connect_to_peer(socks_port:u32,thread_pool:GrowingThreadPool) {
 	let entry:gtk::Entry= builder.get_object("textfield0").unwrap();
 	let thread_pool= std::rc::Rc::new(std::cell::Cell::new(Some(thread_pool)));
 	let window_c= window.clone();
-	button.connect_clicked(move|_but| {
+	button.connect_clicked(move|_| {
 		let entry_text= entry.get_buffer().get_text();
 	//	let entry_text= std::rc::Rc::new(std::cell::Cell::new(entry.get_buffer().get_text()));
 		println!("button clicked with entry text '{}'",entry_text);
 		window_c.close();
-//		open_chat();
-		thread_pool.take().unwrap().execute(move||{
+		let profile_name= profile_name.clone();
+		let thread_pool= thread_pool.take().unwrap();
+		let thread_pool_c= thread_pool.clone();
+		thread_pool_c.execute(move||{
 			//connect_with_address(entry.get_buffer().get_text());
 			println!("connecting to {}",entry_text);
 			let mut stream= socks::Socks5Stream::connect(
@@ -169,11 +232,7 @@ fn connect_to_peer(socks_port:u32,thread_pool:GrowingThreadPool) {
 			).unwrap().into_inner();
 			println!("connected!");
 			std::io::Write::write(&mut stream,b"asdfasdfasdf\nbob\n").unwrap();
-			open_chat(stream);
-			// https://docs.rs/reqwest/0.10.9/reqwest/struct.Proxy.html
-			//let client= reqwest::Client::builder()
-			//	.proxy(reqwest::Proxy::all(&format!("socks5://127.0.0.1:{}",SOCKS_PORT)).unwrap())
-			//	.build().unwrap();
+			open_chat(stream,profile_name,thread_pool);
 		});
 	});
 	window.show_all();
@@ -182,7 +241,7 @@ fn open_glade(path:&str)->gtk::Builder {
 	let src= std::fs::read_to_string(path).unwrap();
 	gtk::Builder::from_string(&src)
 }
-fn select_profile<CB:Fn(&String)+'static>(cb:CB) {
+fn select_profile<CB:Fn(String)+'static>(cb:CB) {
 	use gtk::prelude::*;
 	let builder= open_glade("profile-select.glade");
 	let window:gtk::Window= builder.get_object("window0").unwrap();
@@ -194,7 +253,7 @@ fn select_profile<CB:Fn(&String)+'static>(cb:CB) {
 //			profile_dir_sender.take().unwrap().send(entry.get_buffer().get_text()).unwrap();
 			println!("profile selected, moving on with gui");
 			window.close();
-			cb(&entry.get_buffer().get_text());
+			cb(entry.get_buffer().get_text());
 //			let socks_port= tokio::runtime::Runtime::new().unwrap().block_on(async {
 //				socks_port_receiver.take().unwrap().await.unwrap()
 //			});
@@ -203,10 +262,16 @@ fn select_profile<CB:Fn(&String)+'static>(cb:CB) {
 	}
 	window.show_all();
 }
-fn listen(listener:std::net::TcpListener,thread_pool:GrowingThreadPool) {
+fn listen(
+	listener:std::net::TcpListener,
+	thread_pool:GrowingThreadPool,
+	profile_name:std::sync::Arc<String>
+) {
 	let thread_pool_c= thread_pool.clone();
 	thread_pool.execute(move||{ for stream in listener.incoming() {
 		println!("got listen stream, queueing handle task");
+		let profile_name= profile_name.clone();
+		let thread_pool_cc= thread_pool_c.clone();
 		thread_pool_c.execute(||{
 			println!("got a tor connection!");
 			let gui_stream= stream.unwrap();
@@ -220,31 +285,21 @@ fn listen(listener:std::net::TcpListener,thread_pool:GrowingThreadPool) {
 			println!("peer authenticated");
 			let mut nick= String::new(); std::io::BufRead::read_line(&mut reader,&mut nick).unwrap(); let nick= nick.trim();
 			println!("peer nickname: {}",nick);
-			open_chat(gui_stream);
-			/*
-			let mut line= String::new();
-			loop {
-				line.clear();
-				std::io::BufRead::read_line(&mut reader,&mut line).unwrap(); let line= line.trim();
-				if line.trim()=="quit" {
-					break;
-				}
-				std::io::Write::write(&mut write_stream,b"hello!\n").unwrap();
-			}
-			*/
+			open_chat(gui_stream,profile_name,thread_pool_cc);
 		});
 	}});
 	println!("done listen");
 }
 fn do_menu(
-	profile_dir:&String,
+	profile_name:String,
 	thread_pool:GrowingThreadPool,
 	tor_child_tx:tokio::sync::oneshot::Sender<TorChild>,
 ) {
+	let profile_name= std::sync::Arc::new(profile_name);
 	use gtk::prelude::*;
 	// make profile_dir absolute so that tor can use it for a unix socket
 	let cur_dir= std::env::current_dir().unwrap().into_os_string().into_string().unwrap();
-	let profile_dir= format!("{}/{}",cur_dir,profile_dir);
+	let profile_dir= format!("{}/{}",cur_dir,profile_name);
 	println!("profile_dir is: {}",profile_dir);
 	let onion_key= get_onion_key(&profile_dir);
 	println!("start tor");
@@ -259,14 +314,18 @@ fn do_menu(
 	println!("sending tor child");
 	tor_child_tx.send(tor_child).unwrap();
 	println!("starting listen");
-	listen(listener,thread_pool.clone());
+	listen(listener,thread_pool.clone(),profile_name.clone());
 	let builder= open_glade("menu.glade");
 	let button:gtk::Button= builder.get_object("connect_button").unwrap();
 	let window:gtk::Window= builder.get_object("window").unwrap();
 	window.resize(300,100);
 	let thread_pool= std::rc::Rc::new(std::cell::RefCell::new(thread_pool));
 	button.connect_clicked(move|_but| {
-		connect_to_peer(socks_port,(*thread_pool).borrow().clone());
+		connect_to_peer(
+			socks_port,
+			(*thread_pool).borrow().clone(),
+			profile_name.clone()
+		);
 	});
 	window.show_all();
 }
