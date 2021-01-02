@@ -1,17 +1,27 @@
-how a connection between peers is established
-- A obtains B's authentic onion address (public key)
-- A enters B's onion address on their client, giving B a personal nickname
-- A connects to B's onion address, establishing stream P (primary)
-- A is certain that they are talking to B because only B would have the private key capable of responding to A's rendezvous message from the tor hidden service protocol (https://tor.stackexchange.com/questions/672/how-do-onion-addresses-exactly-work)
-- A sends their own onion address through P
-- B does not know who just connected, but they can verify the onion address
-- B's client prompts for A's onion address so that it can check that this is indeed A
-- B creates a random cookie C and random self-id D
-- B sends D through P
-- B connects to A's onion address, establishing temporary authentication stream Q
-- B sends C,D through Q to A
-- A knows that it is B that just connected because A had previously received D through P
-- A sends C through P
-- B has verified A's onion address
-- Q is closed and authenticated communication continues on P
-- if A and B know each other somehow else and can communicate through a different secret channel, B can authenticate this address with A
+- how a connection between peers is established
+	- A obtains B's authentic onion address (public key)
+	- A enters B's onion address on their client, giving B a personal nickname
+	- A connects to B's onion address, establishing stream P (primary)
+	- A is certain that they are talking to B because only B would have the private key capable of responding to A's rendezvous message from the tor hidden service protocol (https://tor.stackexchange.com/questions/672/how-do-onion-addresses-exactly-work)
+	- A sends their own onion address through P
+	- B does not know who just connected, but they can verify the onion address
+	- B's client prompts for A's onion address so that it can check that this  is indeed A
+	- B creates a random cookie C and random self-id D
+	- B sends D through P
+	- B connects to A's onion address, establishing temporary authentication stream Q
+	- B sends C,D through Q to A
+	- A knows that it is B that just connected because A had previously received D through P
+	- A sends C through P
+	- B has verified A's onion address
+	- Q is closed and authenticated communication continues on P
+	- if A and B know each other somehow else and can communicate through a different secret channel, B can authenticate this address with A
+
+- this protocol is actually very similar to what this question-asker suggests, which is somewhat similar: https://tor.stackexchange.com/questions/20793/p2p-chat-system-communication-between-two-parties
+	- A connects to B through tor creating connection P
+	- A sends A's public key and a nonce through P
+	- P is dropped
+	- B connects to A through tor creating connection Q
+	- B sends the nonce, authenticating themself
+
+- because this latter protocol is similar, i'll use it instead
+- to differentiate between the streams P and Q, send either a 0 or 1 as the initial byte

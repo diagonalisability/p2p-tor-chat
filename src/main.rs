@@ -32,10 +32,14 @@ impl Drop for GrowingThreadPool {
 }
 struct TorChild {
 	process: std::process::Child,
-	stdout_lines: std::io::Lines<std::io::BufReader<std::process::ChildStdout>>,
 	acon: torut::control::AuthenticatedConn<
 		tokio::net::UnixStream,
-		fn(torut::control::AsyncEvent<'static>)->DummyFuture>
+		fn(torut::control::AsyncEvent<'static>)->DummyFuture>,
+	socks_port: u16,
+}
+#[derive(Copy,Clone)]
+struct TorConnector {
+	socks_port: u16
 }
 impl std::fmt::Debug for TorChild {
 	fn fmt(&self,f:&mut std::fmt::Formatter<'_>)-> Result<(),std::fmt::Error> {
@@ -73,7 +77,13 @@ impl TorChild {
 		use std::io::BufRead;
 		let stdout= process.stdout.take().unwrap();
 		let mut lines= std::io::BufReader::new(stdout).lines();
-		Self::wait_for_ready(&mut lines);
+		// wait for tor become ready to accept control connections
+		loop {
+			if lines.next().unwrap().unwrap().contains("Opened Control listener") {
+				println!("control listener open");
+				return;
+			}
+		}
 		let mut ucon;
 		{
 			use tokio::net::UnixStream;
@@ -86,46 +96,52 @@ impl TorChild {
 		ucon.authenticate(&auth_data).await.unwrap();
 		let mut acon= ucon.into_authenticated().await;
 		acon.take_ownership().await.unwrap();
+		// get socks port
+		acon.set_conf("DisableNetwork",Some("0")).await.unwrap();
+		println!("getting socks port");
+		let socks_port= loop {
+			let line= lines.next().unwrap().unwrap();
+			if line.contains("Opened Socks listener on") {
+				break line.rsplit(":").next().unwrap().parse().unwrap();
+			}
+		};
+		println!("socks port: {}",socks_port);
 		TorChild {
 			process: process,
-			stdout_lines: lines,
 			acon: acon,
+			socks_port: socks_port,
 		}
 	}
-	fn wait_for_ready(lines:&mut std::io::Lines<std::io::BufReader<std::process::ChildStdout>>) {
-		loop {
-			if lines.next().unwrap().unwrap().contains("Opened Control listener") {
-				println!("control listener open");
-				return;
-			}
+	fn make_connector(&self)->TorConnector {
+		TorConnector {
+			socks_port: self.socks_port
 		}
 	}
-	async fn make_onion_listener(&mut self,key:torut::onion::TorSecretKeyV3)->std::net::TcpListener {
+	async fn make_onion_listener(
+		&mut self,
+		key:&torut::onion::TorSecretKeyV3
+	)->std::net::TcpListener {
 		let listener= std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 		let port= listener.local_addr().unwrap().port();
 		println!("the OS gave us port {}",port);
 		self.acon.add_onion_v3(&key,false,false,false,Some(0),&mut[
-			(20001,std::net::SocketAddr::new(std::net::IpAddr::from(std::net::Ipv4Addr::new(127,0,0,1)),port))
+			(VIRTUAL_PORT,std::net::SocketAddr::new(std::net::IpAddr::from(std::net::Ipv4Addr::new(127,0,0,1)),port))
 		].iter()).await.unwrap();
 		println!("using onion address {}",key.public().get_onion_address());
 		listener
 	}
-	// returns socks port
-	async fn enable_network(&mut self)->u32 {
-		self.acon.set_conf("DisableNetwork",Some("0")).await.unwrap();
-		println!("getting socks port");
-		loop {
-			let line= self.stdout_lines.next().unwrap().unwrap();
-			if line.contains("Opened Socks listener on") {
-				let port= line.rsplit(":").next().unwrap().parse().unwrap();
-				println!("socks port: {}",port);
-				return port;
-			}
-		}	
+}
+impl TorConnector {
+	fn connect(self,address:&str,port:u16)->std::net::TcpStream {
+		socks::Socks5Stream::connect(
+			format!("127.0.0.1:{}",self.socks_port),
+			format!("{}:{}",address,port).as_str(),
+		).unwrap().into_inner()
 	}
 }
 impl Drop for TorChild {
 	fn drop(&mut self) {
+		// this might not be necessary because we take ownership of the control stream
 		println!("dropping tor");
 		std::process::Command::new("kill") // sends sigterm
 			.args(&[&format!("{}",self.process.id())])
@@ -139,16 +155,38 @@ fn make_gtk_label(text:&String)->gtk::Label {
 	label.set_halign(gtk::Align::Start);
 	label
 }
+fn display_image(messages:&gtk::ListBox,filename:&str) {
+	use gtk::prelude::*;
+	const MAX_IMAGE_SIDELENGTH:i32= 100;
+	let image= gdk_pixbuf::Pixbuf::from_file(filename).unwrap();
+	let (owidth,oheight)= (image.get_width(),image.get_height()); // original
+	use std::cmp::min;
+	let width0= min(owidth,MAX_IMAGE_SIDELENGTH);
+	let height0= width0 * oheight / owidth;
+	let height1= min(oheight,MAX_IMAGE_SIDELENGTH);
+	let width1= height1 * owidth / oheight;
+	let (width,height)= (min(width0,width1),min(height0,height1));
+	let image= image.scale_simple(
+		width,
+		height,
+		gdk_pixbuf::InterpType::Bilinear
+	).unwrap();
+	let image= gtk::Image::from_pixbuf(Some(&image));
+	messages.add(&image);
+}
 // called from non-gtk thread
 fn open_chat(
-	stream:std::net::TcpStream,
+	peer_public_key:torut::onion::TorPublicKeyV3,
+	streams:[std::net::TcpStream;2],
 	profile_name:std::sync::Arc<String>,
 	thread_pool:GrowingThreadPool
 ) {
-	let stream= std::sync::Arc::new(std::sync::Mutex::new(Some(stream)));
+	println!("opening chat");
+	let streams= std::sync::Arc::new(std::sync::Mutex::new(Some(streams)));
 	glib::source::idle_add(move||{
-		println!("opening chat");
-		let stream= stream.lock().unwrap().take().unwrap();
+		let streams= streams.lock().unwrap().take().unwrap();
+		let write_stream= std::rc::Rc::new(std::cell::RefCell::new(streams[0].try_clone().unwrap()));
+		let read_stream= (*write_stream).borrow().try_clone().unwrap();	
 		let builder= open_glade("chat.glade");
 		use gtk::prelude::*;
 		let window:gtk::Window= builder.get_object("window").unwrap();
@@ -156,20 +194,17 @@ fn open_chat(
 		let entry:gtk::Entry= builder.get_object("entry").unwrap();
 		messages.add(&make_gtk_label(&format!("chat for profile: {}",profile_name)));
 		{
-			// TODO: fix this double-clone of stream here
-			let stream= stream.try_clone().unwrap();
 			let messages= messages.clone();
 			entry.connect_activate(move|entry|{
-				let mut stream= stream.try_clone().unwrap();
 				let buf= entry.get_buffer();
 				let message= buf.get_text();
 				buf.set_text("");
-				println!("message sent: '{}'",message);
 				let label= make_gtk_label(&format!("you: {}",message));
 				label.show();
 				messages.add(&label);
 				use std::io::Write;
-				stream.write(&(message+"\n").into_bytes()).unwrap();
+				println!("sending message: '{}'",message);
+				(*write_stream).borrow_mut().write(&(message+"\n").into_bytes()).unwrap();
 			});
 		}
 		window.show_all();
@@ -189,51 +224,82 @@ fn open_chat(
 		);
 		thread_pool.execute(move||{
 			let tx= tx.clone();
-			let read_stream= stream.try_clone().unwrap();
 			use std::io::BufRead;
 			for line in std::io::BufReader::new(read_stream).lines() {
 				let line= line.unwrap();
-				println!("got a line!: {}",line);
-				match tx.send(line) {
-					Ok(()) => (),
-					Err(err) => { println!("error sending: {}",err); }
-				};
+				println!("got a line: '{}'",line);
+				tx.send(line).unwrap();
 			}
 		});
 		glib::Continue(false)
 	});
 }
+
 fn connect_to_peer(
-	socks_port:u32,
+	tor_connector:TorConnector,
 	thread_pool:GrowingThreadPool,
-	profile_name:std::sync::Arc<String>
+	my_public_key:torut::onion::TorPublicKeyV3,
+	peer_address:&str,
+	nonce_peer_map:&std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Nonce,Peer>>>,
+) {
+	println!("generating nonce");
+	let mut nonce= [0u8;NONCE_SIZE];
+	use rand::RngCore;
+	rand::rngs::OsRng.fill_bytes(&mut nonce);
+	println!(
+		"actual nonce is {}...{}",
+		nonce[0],
+		nonce[NONCE_SIZE-1],
+	);
+	let torut_peer_address:torut::onion::OnionAddressV3=
+		std::str::FromStr::from_str(peer_address.strip_suffix(".onion").unwrap()).unwrap();
+	let peer_public_key= torut_peer_address.get_public_key();
+	{
+		let mut nonce_peer_map= nonce_peer_map.lock().unwrap();
+		nonce_peer_map.insert(nonce,Peer {
+			public_key:peer_public_key,
+			streams:[None,None],
+		});
+	}
+	println!("connecting to {}",peer_address);
+	let mut stream= tor_connector.connect(peer_address,VIRTUAL_PORT);
+	println!("connected!");
+	let stream_type= [2];
+	use std::io::Write;
+	stream.write(&stream_type).unwrap();
+	stream.write(&my_public_key.to_bytes()).unwrap();
+	stream.write(&nonce).unwrap();
+	// the receiver's job is to "call me back", so drop this connection now
+}
+const NONCE_SIZE:usize= 256; // 256 bytes * 8 bits/byte = 2048 bits
+type Nonce= [u8;NONCE_SIZE];
+const VIRTUAL_PORT:u16= 20001;
+fn prompt_for_peer_address(
+	tor_connector:TorConnector,
+	thread_pool:GrowingThreadPool,
+	my_public_key:torut::onion::TorPublicKeyV3,
+	nonce_peer_map:std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Nonce,Peer>>>,
 ) {
 	use gtk::prelude::*;
 	let builder= open_glade("peer-connect.glade");
 	let window:gtk::Window= builder.get_object("window0").unwrap();
 	let button:gtk::Button= builder.get_object("button0").unwrap();
 	let entry:gtk::Entry= builder.get_object("textfield0").unwrap();
-	let thread_pool= std::rc::Rc::new(std::cell::Cell::new(Some(thread_pool)));
 	let window_c= window.clone();
 	button.connect_clicked(move|_| {
 		let entry_text= entry.get_buffer().get_text();
-	//	let entry_text= std::rc::Rc::new(std::cell::Cell::new(entry.get_buffer().get_text()));
 		println!("button clicked with entry text '{}'",entry_text);
-		window_c.close();
-		let profile_name= profile_name.clone();
-		let thread_pool= thread_pool.take().unwrap();
 		let thread_pool_c= thread_pool.clone();
-		thread_pool_c.execute(move||{
-			//connect_with_address(entry.get_buffer().get_text());
-			println!("connecting to {}",entry_text);
-			let mut stream= socks::Socks5Stream::connect(
-				format!("127.0.0.1:{}",socks_port),
-				format!("{}:20001",entry_text).as_str(),
-			).unwrap().into_inner();
-			println!("connected!");
-			std::io::Write::write(&mut stream,b"asdfasdfasdf\nbob\n").unwrap();
-			open_chat(stream,profile_name,thread_pool);
-		});
+		let nonce_peer_map= nonce_peer_map.clone();
+		thread_pool.execute(move||{connect_to_peer(
+			tor_connector,
+			thread_pool_c,
+			my_public_key,
+			&entry_text,
+			&nonce_peer_map,
+		)});
+		// TODO make sure the address parses correctly
+		window_c.close();
 	});
 	window.show_all();
 }
@@ -249,51 +315,98 @@ fn select_profile<CB:Fn(String)+'static>(cb:CB) {
 	let entry:gtk::Entry= builder.get_object("textfield0").unwrap();
 	{
 		let window= window.clone();
-		button.connect_clicked(move |_but| {
-//			profile_dir_sender.take().unwrap().send(entry.get_buffer().get_text()).unwrap();
+		button.connect_clicked(move|_button| {
 			println!("profile selected, moving on with gui");
 			window.close();
 			cb(entry.get_buffer().get_text());
-//			let socks_port= tokio::runtime::Runtime::new().unwrap().block_on(async {
-//				socks_port_receiver.take().unwrap().await.unwrap()
-//			});
-//			connect_to_peer(socks_port,thread_pool.take().unwrap());
 		});
 	}
 	window.show_all();
 }
+struct Peer {
+	public_key:torut::onion::TorPublicKeyV3,
+	streams:[Option<std::net::TcpStream>;2],
+}
 fn listen(
 	listener:std::net::TcpListener,
 	thread_pool:GrowingThreadPool,
-	profile_name:std::sync::Arc<String>
+	profile_name:std::sync::Arc<String>,
+	tor_connector:TorConnector,
+	nonce_peer_map:std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Nonce,Peer>>>,
 ) {
-	let thread_pool_c= thread_pool.clone();
-	thread_pool.execute(move||{ for stream in listener.incoming() {
+	use std::io::{Read,Write};
+	for stream in listener.incoming() {
 		println!("got listen stream, queueing handle task");
 		let profile_name= profile_name.clone();
-		let thread_pool_cc= thread_pool_c.clone();
-		thread_pool_c.execute(||{
-			println!("got a tor connection!");
-			let gui_stream= stream.unwrap();
-			let write_stream= gui_stream.try_clone().unwrap();
-			let read_stream= write_stream.try_clone().unwrap();
-			let mut reader= std::io::BufReader::new(&read_stream);
-			let mut peer_id= String::new(); std::io::BufRead::read_line(&mut reader,&mut peer_id).unwrap(); let peer_id= peer_id.trim();
-			println!("peer identifies themself as: {}",peer_id);
-			println!("authenticating peer by sending cookie");
-			// TODO (open a stream to peer_id.onion, peer should accept and send the cookie back down this stream)
-			println!("peer authenticated");
-			let mut nick= String::new(); std::io::BufRead::read_line(&mut reader,&mut nick).unwrap(); let nick= nick.trim();
-			println!("peer nickname: {}",nick);
-			open_chat(gui_stream,profile_name,thread_pool_cc);
+		// https://docs.rs/rand/0.8.0/rand/rngs/struct.OsRng.html
+		let thread_pool_c= thread_pool.clone();
+		let nonce_peer_map= nonce_peer_map.clone();
+		thread_pool.execute(move||{
+			let mut stream= stream.unwrap();
+			let mut stream_type= [0u8];
+			stream.read_exact(&mut stream_type).unwrap();
+			let stream_type= stream_type[0];
+			match stream_type {
+				// initial connection
+				2=> {
+					let mut peer_public_key= [0u8;32];
+					let mut nonce= [0u8;NONCE_SIZE];
+					stream.read_exact(&mut peer_public_key).unwrap();
+					stream.read_exact(&mut nonce).unwrap();
+					println!(
+						"received nonce {}...{}",
+						nonce[0],
+						nonce[NONCE_SIZE-1],
+					);
+					// there should be some validation here
+					let peer_public_key= torut::onion::TorPublicKeyV3::from_bytes(&peer_public_key).unwrap();
+					let peer_address= peer_public_key.get_onion_address();
+					// streams[0] is the blocking stream, streams[1] is the nonblocking stream
+					let streams:[std::net::TcpStream;2]= std::convert::TryFrom::try_from((0..2).map(|stream_type:u8| {
+						let mut stream= tor_connector.connect(&format!("{}",peer_address),VIRTUAL_PORT);
+						// connecting back to the originator using their nonce
+						let stream_type= [stream_type];
+						stream.write(&stream_type).unwrap();
+						stream.write(&nonce).unwrap();
+						stream
+					}).collect::<Vec<_>>()).unwrap();
+					open_chat(
+						peer_public_key,
+						streams,
+						profile_name,
+						thread_pool_c,
+					);
+				}
+				0|1=> {
+					let mut nonce= [0u8;NONCE_SIZE];
+					stream.read_exact(&mut nonce).unwrap();
+					let nonce_peer_map= nonce_peer_map.clone();
+					let mut nonce_peer_map= nonce_peer_map.lock().unwrap();
+					let nonce_= nonce_peer_map.keys().next().unwrap();
+					let peer= nonce_peer_map.get_mut(&nonce).unwrap();
+					let stream_type:usize= stream_type.into();
+					peer.streams[stream_type].replace(stream);
+					if peer.streams.iter().all(Option::is_some) {
+						println!("both streams received, sending peer to main thread for chat gui");
+						let profile_name= profile_name.clone();
+						open_chat(
+							peer.public_key,
+							std::convert::TryFrom::try_from(peer.streams.iter().map(|x|x.as_ref().unwrap().try_clone().unwrap()).collect::<Vec<_>>()).unwrap(),
+							profile_name,
+							thread_pool_c,
+						);
+					}
+					println!("one stream received, waiting for the other...");
+				}
+				_ => panic!("bad stream_type sent from peer")
+			}
 		});
-	}});
-	println!("done listen");
+	}
 }
-fn do_menu(
+fn display_menu(
 	profile_name:String,
 	thread_pool:GrowingThreadPool,
-	tor_child_tx:tokio::sync::oneshot::Sender<TorChild>,
+	mut tor_child_rc:std::rc::Rc<std::cell::Cell<Option<TorChild>>>,
 ) {
 	let profile_name= std::sync::Arc::new(profile_name);
 	use gtk::prelude::*;
@@ -304,48 +417,59 @@ fn do_menu(
 	let onion_key= get_onion_key(&profile_dir);
 	println!("start tor");
 	let rt= tokio::runtime::Runtime::new().unwrap();
-	let (tor_child,listener,socks_port)= rt.block_on(async {
+	let nonce_peer_map= std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+	let tor_child= rt.block_on(async {
 		let mut tor_child= TorChild::new(&profile_dir,&format!("{}/torrc",cur_dir)).await;
 		println!("connected to control port");
-		let listener= tor_child.make_onion_listener(onion_key).await;
-		let socks_port= tor_child.enable_network().await;
-		(tor_child,listener,socks_port)
+		let listener= tor_child.make_onion_listener(&onion_key).await;
+		let thread_pool_c= thread_pool.clone();
+		let tor_connector= tor_child.make_connector();
+		let nonce_peer_map= nonce_peer_map.clone();
+		thread_pool.execute(move||{listen(
+			listener,
+			thread_pool_c,
+			profile_name,
+			tor_connector,
+			nonce_peer_map,
+		)});
+		tor_child
 	});
-	println!("sending tor child");
-	tor_child_tx.send(tor_child).unwrap();
-	println!("starting listen");
-	listen(listener,thread_pool.clone(),profile_name.clone());
+	let tor_connector= tor_child.make_connector();
+	tor_child_rc.set(Some(tor_child));
 	let builder= open_glade("menu.glade");
 	let button:gtk::Button= builder.get_object("connect_button").unwrap();
 	let window:gtk::Window= builder.get_object("window").unwrap();
 	window.resize(300,100);
 	let thread_pool= std::rc::Rc::new(std::cell::RefCell::new(thread_pool));
 	button.connect_clicked(move|_but| {
-		connect_to_peer(
-			socks_port,
-			(*thread_pool).borrow().clone(),
-			profile_name.clone()
+		let nonce_peer_map= nonce_peer_map.clone();
+		prompt_for_peer_address(
+			tor_connector,
+			thread_pool.borrow().clone(),
+			onion_key.public(),
+			nonce_peer_map,
 		);
 	});
 	window.show_all();
 }
 fn main() {
-	let rt= tokio::runtime::Runtime::new().unwrap();
 	let thread_pool= GrowingThreadPool::new();
 	gtk::init().unwrap();
 	println!("gtk started");
 	let thread_pool_rc= std::rc::Rc::new(std::cell::Cell::new(Some(thread_pool.clone())));
-	let (tor_child_tx,tor_child_rx)= tokio::sync::oneshot::channel();
-	let tor_child_tx= std::rc::Rc::new(std::cell::Cell::new(Some(tor_child_tx)));
-	select_profile(move|prof|{do_menu(
-		prof,
-		(*thread_pool_rc).take().unwrap(),
-		(*tor_child_tx).take().unwrap(),
-	);});
+	let tor_child_rc= std::rc::Rc::new(std::cell::Cell::new(None));
+	{
+		let tor_child_rc= tor_child_rc.clone();
+		select_profile(move|prof|{display_menu(
+			prof,
+			(*thread_pool_rc).take().unwrap(),
+			tor_child_rc.clone()
+		);});
+	}
 	gtk::main();
-	// keep tor_child here for RAII when gtk::main unblocks
-	let _tor_child= rt.block_on(tor_child_rx);
 	thread_pool.join();
+	drop(tor_child_rc);
+	// tor_child_rc destructs here, killing tor
 }
 fn get_onion_key(profile_dir:&String)->torut::onion::TorSecretKeyV3 {
 	let key_path= format!("{}/key",profile_dir);

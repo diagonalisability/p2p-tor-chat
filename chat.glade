@@ -23,6 +23,7 @@
                   <object class="GtkListBox" id="messages">
                     <property name="visible">True</property>
                     <property name="can-focus">False</property>
+                    <property name="halign">start</property>
                   </object>
                 </child>
               </object>
