@@ -81,7 +81,7 @@ impl TorChild {
 		loop {
 			if lines.next().unwrap().unwrap().contains("Opened Control listener") {
 				println!("control listener open");
-				return;
+				break;
 			}
 		}
 		let mut ucon;
