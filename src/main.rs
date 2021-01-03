@@ -174,6 +174,15 @@ fn display_image(messages:&gtk::ListBox,filename:&str) {
 	let image= gtk::Image::from_pixbuf(Some(&image));
 	messages.add(&image);
 }
+#[derive(serde::Serialize,serde::Deserialize)]
+enum Message {
+	Text(String),
+	FileOffer {
+		file_id: u64,
+		file_size: u64
+	},
+	FileRequest(u64), // file_id
+}
 // called from non-gtk thread
 fn open_chat(
 	peer_public_key:torut::onion::TorPublicKeyV3,
@@ -185,8 +194,8 @@ fn open_chat(
 	let streams= std::sync::Arc::new(std::sync::Mutex::new(Some(streams)));
 	glib::source::idle_add(move||{
 		let streams= streams.lock().unwrap().take().unwrap();
-		let write_stream= std::rc::Rc::new(std::cell::RefCell::new(streams[0].try_clone().unwrap()));
-		let read_stream= (*write_stream).borrow().try_clone().unwrap();	
+		let read_stream= streams[0].try_clone().unwrap();
+		let write_stream= std::sync::Arc::new(std::sync::Mutex::new(read_stream.try_clone().unwrap()));
 		let builder= open_glade("chat.glade");
 		use gtk::prelude::*;
 		let window:gtk::Window= builder.get_object("window").unwrap();
@@ -204,7 +213,8 @@ fn open_chat(
 				messages.add(&label);
 				use std::io::Write;
 				println!("sending message: '{}'",message);
-				(*write_stream).borrow_mut().write(&(message+"\n").into_bytes()).unwrap();
+				let mut write_stream= write_stream.lock().unwrap();
+				write_stream.write_all(&bincode::serialize(&Message::Text(message)).unwrap()).unwrap();
 			});
 		}
 		window.show_all();
@@ -224,12 +234,38 @@ fn open_chat(
 		);
 		thread_pool.execute(move||{
 			let tx= tx.clone();
-			use std::io::BufRead;
-			for line in std::io::BufReader::new(read_stream).lines() {
-				let line= line.unwrap();
-				println!("got a line: '{}'",line);
-				tx.send(line).unwrap();
+			loop {
+				let message:Message=
+					bincode::deserialize_from(read_stream.try_clone().unwrap()).unwrap();
+				println!("parsed the message!");
+				use Message::*;
+				match message {
+					Text(str)=> {
+						println!("peer sent text: '{}'",str);
+						tx.send(str).unwrap();
+					}
+					_=> { todo!("got some other kind of message"); }
+				}
 			}
+		});
+		let chooser= gtk::FileChooserDialog::with_buttons::<gtk::Window>(
+			None, // title
+			None, // parent
+			gtk::FileChooserAction::Open,
+			&[("send",gtk::ResponseType::Accept)],
+		);
+		let image_button:gtk::Button= builder.get_object("send-file-button").unwrap();
+		image_button.connect_clicked(move|_button| {
+			println!("image button clicked!");
+			let chooser_c= chooser.clone();
+			chooser.connect_response(move|_dialog,_response_type| {
+				println!(
+					"the selected file was {:?}",
+					gio::FileExt::get_path(&chooser_c.get_file().unwrap()).unwrap()
+				);
+				chooser_c.hide();
+			});
+			chooser.run();
 		});
 		glib::Continue(false)
 	});
@@ -237,7 +273,6 @@ fn open_chat(
 
 fn connect_to_peer(
 	tor_connector:TorConnector,
-	thread_pool:GrowingThreadPool,
 	my_public_key:torut::onion::TorPublicKeyV3,
 	peer_address:&str,
 	nonce_peer_map:&std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Nonce,Peer>>>,
@@ -289,11 +324,9 @@ fn prompt_for_peer_address(
 	button.connect_clicked(move|_| {
 		let entry_text= entry.get_buffer().get_text();
 		println!("button clicked with entry text '{}'",entry_text);
-		let thread_pool_c= thread_pool.clone();
 		let nonce_peer_map= nonce_peer_map.clone();
 		thread_pool.execute(move||{connect_to_peer(
 			tor_connector,
-			thread_pool_c,
 			my_public_key,
 			&entry_text,
 			&nonce_peer_map,
@@ -382,7 +415,6 @@ fn listen(
 					stream.read_exact(&mut nonce).unwrap();
 					let nonce_peer_map= nonce_peer_map.clone();
 					let mut nonce_peer_map= nonce_peer_map.lock().unwrap();
-					let nonce_= nonce_peer_map.keys().next().unwrap();
 					let peer= nonce_peer_map.get_mut(&nonce).unwrap();
 					let stream_type:usize= stream_type.into();
 					peer.streams[stream_type].replace(stream);
@@ -403,10 +435,10 @@ fn listen(
 		});
 	}
 }
-fn display_menu(
+fn open_menu(
 	profile_name:String,
 	thread_pool:GrowingThreadPool,
-	mut tor_child_rc:std::rc::Rc<std::cell::Cell<Option<TorChild>>>,
+	tor_child_rc:std::rc::Rc<std::cell::Cell<Option<TorChild>>>,
 ) {
 	let profile_name= std::sync::Arc::new(profile_name);
 	use gtk::prelude::*;
@@ -453,18 +485,29 @@ fn display_menu(
 	window.show_all();
 }
 fn main() {
+	let args:Vec<String>= std::env::args().collect();
+	if args.len() > 2 {
+		println!("arguments: profile_name");
+	}
+	println!("command-line arguments: {:?}",args);
 	let thread_pool= GrowingThreadPool::new();
 	gtk::init().unwrap();
 	println!("gtk started");
 	let thread_pool_rc= std::rc::Rc::new(std::cell::Cell::new(Some(thread_pool.clone())));
 	let tor_child_rc= std::rc::Rc::new(std::cell::Cell::new(None));
 	{
+		// running the program with a profile name argument skips the dialog
 		let tor_child_rc= tor_child_rc.clone();
-		select_profile(move|prof|{display_menu(
+		let open_menu= move|prof|{open_menu(
 			prof,
 			(*thread_pool_rc).take().unwrap(),
 			tor_child_rc.clone()
-		);});
+		);};
+		if args.len() == 2 {
+			open_menu(args[1].clone());
+		} else {
+			select_profile(open_menu);
+		}
 	}
 	gtk::main();
 	thread_pool.join();
