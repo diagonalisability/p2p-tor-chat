@@ -174,16 +174,38 @@ fn display_image(messages:&gtk::ListBox,filename:&str) {
 	let image= gtk::Image::from_pixbuf(Some(&image));
 	messages.add(&image);
 }
+type FileId= u64;
+type FileSize= u64; // measured in bytes
 #[derive(serde::Serialize,serde::Deserialize)]
 enum Message {
 	Text(String),
 	FileOffer {
-		file_id: u64,
-		file_size: u64
+		id: FileId,
+		size: FileSize,
+		name: String
 	},
-	FileRequest(u64), // file_id
+	FileRequest(FileId),
+}
+struct IdFileMap {
+	o: std::collections::BTreeMap<FileId,std::path::PathBuf>,
+	next_id: FileId,
+}
+impl IdFileMap {
+	fn new()->Self {
+		IdFileMap {
+			o: std::collections::BTreeMap::new(),
+			next_id: 0,
+		}
+	}
+	fn next_id(&mut self)->FileId {
+		let ret= self.next_id;
+		self.next_id+= 1;
+		return ret;
+	}
 }
 // called from non-gtk thread
+// streams[0] is the nonblocking stream, streams[1] is the blocking stream
+// you can remember this by thinking of the index as a boolean "is_blocking"
 fn open_chat(
 	peer_public_key:torut::onion::TorPublicKeyV3,
 	streams:[std::net::TcpStream;2],
@@ -192,10 +214,13 @@ fn open_chat(
 ) {
 	println!("opening chat");
 	let streams= std::sync::Arc::new(std::sync::Mutex::new(Some(streams)));
+	use std::io::Write;
 	glib::source::idle_add(move||{
 		let streams= streams.lock().unwrap().take().unwrap();
 		let read_stream= streams[0].try_clone().unwrap();
 		let write_stream= std::sync::Arc::new(std::sync::Mutex::new(read_stream.try_clone().unwrap()));
+		let blocking_stream= &streams[1];
+		//let blocking_read_stream= blocking_write_stream.try_clone().unwrap();
 		let builder= open_glade("chat.glade");
 		use gtk::prelude::*;
 		let window:gtk::Window= builder.get_object("window").unwrap();
@@ -204,6 +229,7 @@ fn open_chat(
 		messages.add(&make_gtk_label(&format!("chat for profile: {}",profile_name)));
 		{
 			let messages= messages.clone();
+			let write_stream= write_stream.clone();
 			entry.connect_activate(move|entry|{
 				let buf= entry.get_buffer();
 				let message= buf.get_text();
@@ -211,41 +237,104 @@ fn open_chat(
 				let label= make_gtk_label(&format!("you: {}",message));
 				label.show();
 				messages.add(&label);
-				use std::io::Write;
 				println!("sending message: '{}'",message);
 				let mut write_stream= write_stream.lock().unwrap();
 				write_stream.write_all(&bincode::serialize(&Message::Text(message)).unwrap()).unwrap();
 			});
 		}
-		window.show_all();
+		let id_file_map= std::sync::Arc::new(std::sync::Mutex::new(IdFileMap::new()));
+		let send_queue:std::sync::Arc<(std::sync::Mutex<std::vec::Vec<u64>>,std::sync::Condvar)>= std::sync::Arc::new((
+			std::sync::Mutex::new(vec![]),
+			std::sync::Condvar::new(),
+		));
+		let _blocking_write_thread= {
+			let send_queue= send_queue.clone();
+			let mut blocking_stream= blocking_stream.try_clone().unwrap();
+			let id_file_map= id_file_map.clone();
+			std::thread::spawn(move||{
+				let (send_queue,cvar)= &*send_queue;
+				loop {
+					let id= {
+						let mut send_queue= send_queue.lock().unwrap();
+						// cvar.wait can fail spuriously, from my understanding, which is
+						// why the waiting must be looped. a bit strange but that's fine.
+						// https://doc.rust-lang.org/std/sync/struct.Condvar.html#method.wait
+						while (*send_queue).len()==0 {
+							send_queue= cvar.wait(send_queue).unwrap();
+						}
+						// got a file to send, remove its id from the queue
+						let id= send_queue[0];
+						send_queue.remove(0);
+						id
+						// drop lock
+					};
+					let id_file_map= id_file_map.lock().unwrap();
+					let path= id_file_map.o.get(&id);
+					if path.is_none() {
+						println!("peer asked for a file-id which was never sent");
+						continue;
+					}
+					// block and send the file
+					// todo: make this interruptable
+					println!("writing to blocking thread");
+					std::io::copy(&mut std::fs::File::open(path.unwrap()).unwrap(),&mut blocking_stream).unwrap();
+					println!("finished writing");
+				}
+			})
+		};
 		let (tx,rx)= glib::MainContext::channel(glib::PRIORITY_DEFAULT);
-		rx.attach(
-			None, // use default context
-			move|msg| {
-				println!("got message on the main thread: {}",msg);
-				let text= format!("peer: {}",msg);
-				let label= gtk::Label::new(Some(&text));
-				label.set_halign(gtk::Align::Start);
-				println!("adding label with text {}",text);
-				messages.add(&label);
-				label.show();
+		{
+			let write_stream= write_stream.clone();
+			rx.attach(None/*use default context*/,move|msg| {
+				let write_stream= write_stream.clone();
+				use Message::*;
+				match msg {
+					Text(str)=> {
+						println!("peer sent text: '{}'",str);
+						let str= format!("peer: {}",str);
+						let label= gtk::Label::new(Some(&str));
+						label.set_halign(gtk::Align::Start);
+						println!("adding label with text {}",str);
+						label.show();
+						messages.add(&label);
+					}
+					FileOffer{ id:file_id,size:file_size,name:file_name }=> {
+						println!(
+							"peer is offering a file send with id {}, name {}, and size {}b",
+							file_id,
+							file_name,
+							file_size,
+						);
+						let button= gtk::Button::new();
+						button.add(&gtk::Label::new(Some(&format!("download file '{}'",file_name))));
+						button.set_halign(gtk::Align::Start);
+						button.connect_clicked(move|_button| {
+							let mut write_stream= write_stream.lock().unwrap();
+							write_stream.write_all(&bincode::serialize(&Message::FileRequest(file_id)).unwrap()).unwrap();
+						});
+						button.show_all();
+						messages.add(&button);
+					}
+					FileRequest(id)=> {
+						println!("peer is asking for file <id={}>, sending it",id);
+						let (send_queue,cvar)= &*send_queue;
+						let mut send_queue= send_queue.lock().unwrap();
+						send_queue.push(id);
+						cvar.notify_one();
+					}
+					//_=> { todo!("got some as-of-yet-unhandled type of message"); }
+				}
 				glib::Continue(true)
-			}
-		);
+			});
+		}
 		thread_pool.execute(move||{
 			let tx= tx.clone();
 			loop {
+				// this read blocks, which is why it is done in a separate thread
 				let message:Message=
 					bincode::deserialize_from(read_stream.try_clone().unwrap()).unwrap();
 				println!("parsed the message!");
-				use Message::*;
-				match message {
-					Text(str)=> {
-						println!("peer sent text: '{}'",str);
-						tx.send(str).unwrap();
-					}
-					_=> { todo!("got some other kind of message"); }
-				}
+				tx.send(message).unwrap();
 			}
 		});
 		let chooser= gtk::FileChooserDialog::with_buttons::<gtk::Window>(
@@ -254,23 +343,39 @@ fn open_chat(
 			gtk::FileChooserAction::Open,
 			&[("send",gtk::ResponseType::Accept)],
 		);
+		chooser.connect_response(move|chooser,_response_type| {
+			chooser.hide();
+			// get the path and put it in the id->path map
+			let file_path= gio::FileExt::get_path(&chooser.get_file().unwrap()).unwrap();
+			let mut id_file_map= id_file_map.lock().unwrap();
+			println!("the selected file was {:?}",file_path);
+			let mut write_stream= write_stream.lock().unwrap();
+			let file_id= id_file_map.next_id();
+			// get the file length and inform peer about the available file
+			let file_len= std::fs::metadata(&file_path).unwrap().len();
+			write_stream.write_all(&bincode::serialize(&Message::FileOffer{
+				id:file_id,
+				size:file_len,
+				name:file_path.file_name().unwrap().to_string_lossy().to_string(),
+			}).unwrap()).unwrap();
+			id_file_map.o.insert(file_id,file_path);
+		});
 		let image_button:gtk::Button= builder.get_object("send-file-button").unwrap();
 		image_button.connect_clicked(move|_button| {
 			println!("image button clicked!");
-			let chooser_c= chooser.clone();
-			chooser.connect_response(move|_dialog,_response_type| {
-				println!(
-					"the selected file was {:?}",
-					gio::FileExt::get_path(&chooser_c.get_file().unwrap()).unwrap()
-				);
-				chooser_c.hide();
-			});
 			chooser.run();
 		});
+		window.connect_delete_event(move|_window,_event| {
+			println!("chat window closed");
+			// this should do more, possibly signalling the other client
+			// that the conversation is over
+			//blocking_thread.join();
+			todo!();
+		});
+		window.show_all();
 		glib::Continue(false)
 	});
 }
-
 fn connect_to_peer(
 	tor_connector:TorConnector,
 	my_public_key:torut::onion::TorPublicKeyV3,
@@ -298,7 +403,7 @@ fn connect_to_peer(
 	}
 	println!("connecting to {}",peer_address);
 	let mut stream= tor_connector.connect(peer_address,VIRTUAL_PORT);
-	println!("connected!");
+	println!("established initial connection, waiting for receiver to connect back with 2 streams");
 	let stream_type= [2];
 	use std::io::Write;
 	stream.write(&stream_type).unwrap();
@@ -391,10 +496,10 @@ fn listen(
 						nonce[0],
 						nonce[NONCE_SIZE-1],
 					);
+					println!("connecting back to originator with 2 streams");
 					// there should be some validation here
 					let peer_public_key= torut::onion::TorPublicKeyV3::from_bytes(&peer_public_key).unwrap();
 					let peer_address= peer_public_key.get_onion_address();
-					// streams[0] is the blocking stream, streams[1] is the nonblocking stream
 					let streams:[std::net::TcpStream;2]= std::convert::TryFrom::try_from((0..2).map(|stream_type:u8| {
 						let mut stream= tor_connector.connect(&format!("{}",peer_address),VIRTUAL_PORT);
 						// connecting back to the originator using their nonce
@@ -419,7 +524,7 @@ fn listen(
 					let stream_type:usize= stream_type.into();
 					peer.streams[stream_type].replace(stream);
 					if peer.streams.iter().all(Option::is_some) {
-						println!("both streams received, sending peer to main thread for chat gui");
+						println!("both streams received, sending peer info to gui thread to open chat");
 						let profile_name= profile_name.clone();
 						open_chat(
 							peer.public_key,
@@ -427,8 +532,9 @@ fn listen(
 							profile_name,
 							thread_pool_c,
 						);
+					} else {
+						println!("one stream received, waiting for the other...");
 					}
-					println!("one stream received, waiting for the other...");
 				}
 				_ => panic!("bad stream_type sent from peer")
 			}
