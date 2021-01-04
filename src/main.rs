@@ -155,10 +155,13 @@ fn make_gtk_label(text:&String)->gtk::Label {
 	label.set_halign(gtk::Align::Start);
 	label
 }
-fn display_image(messages:&gtk::ListBox,filename:&str) {
-	use gtk::prelude::*;
+// error means file isn't an image
+fn open_image(filename:&str)->Result<gtk::Image,()> {
 	const MAX_IMAGE_SIDELENGTH:i32= 100;
-	let image= gdk_pixbuf::Pixbuf::from_file(filename).unwrap();
+	let image= match gdk_pixbuf::Pixbuf::from_file(filename) {
+		Result::Ok(image)=> image,
+		Result::Err(_)=> return Err(()),
+	};
 	let (owidth,oheight)= (image.get_width(),image.get_height()); // original
 	use std::cmp::min;
 	let width0= min(owidth,MAX_IMAGE_SIDELENGTH);
@@ -171,8 +174,7 @@ fn display_image(messages:&gtk::ListBox,filename:&str) {
 		height,
 		gdk_pixbuf::InterpType::Bilinear
 	).unwrap();
-	let image= gtk::Image::from_pixbuf(Some(&image));
-	messages.add(&image);
+	Ok(gtk::Image::from_pixbuf(Some(&image)))
 }
 type FileId= u64;
 type FileSize= u64; // measured in bytes
@@ -209,24 +211,22 @@ impl IdFileMap {
 fn open_chat(
 	peer_public_key:torut::onion::TorPublicKeyV3,
 	streams:[std::net::TcpStream;2],
-	profile_name:std::sync::Arc<String>,
+	profile_dir:std::sync::Arc<String>,
 	thread_pool:GrowingThreadPool
 ) {
 	println!("opening chat");
 	let streams= std::sync::Arc::new(std::sync::Mutex::new(Some(streams)));
 	use std::io::Write;
 	glib::source::idle_add(move||{
-		let streams= streams.lock().unwrap().take().unwrap();
+		let mut streams= streams.lock().unwrap().take().unwrap();
 		let read_stream= streams[0].try_clone().unwrap();
 		let write_stream= std::sync::Arc::new(std::sync::Mutex::new(read_stream.try_clone().unwrap()));
-		let blocking_stream= &streams[1];
-		//let blocking_read_stream= blocking_write_stream.try_clone().unwrap();
 		let builder= open_glade("chat.glade");
 		use gtk::prelude::*;
 		let window:gtk::Window= builder.get_object("window").unwrap();
 		let messages:gtk::ListBox= builder.get_object("messages").unwrap();
 		let entry:gtk::Entry= builder.get_object("entry").unwrap();
-		messages.add(&make_gtk_label(&format!("chat for profile: {}",profile_name)));
+		messages.add(&make_gtk_label(&format!("chat for profile: {}",profile_dir)));
 		{
 			let messages= messages.clone();
 			let write_stream= write_stream.clone();
@@ -243,31 +243,13 @@ fn open_chat(
 			});
 		}
 		let id_file_map= std::sync::Arc::new(std::sync::Mutex::new(IdFileMap::new()));
-		let send_queue:std::sync::Arc<(std::sync::Mutex<std::vec::Vec<u64>>,std::sync::Condvar)>= std::sync::Arc::new((
-			std::sync::Mutex::new(vec![]),
-			std::sync::Condvar::new(),
-		));
-		let _blocking_write_thread= {
-			let send_queue= send_queue.clone();
-			let mut blocking_stream= blocking_stream.try_clone().unwrap();
+		let (send_file_tx,send_file_rx)= std::sync::mpsc::channel();
+		let _blocking_write_thread= std::thread::spawn({
+			let mut blocking_stream= streams[1].try_clone().unwrap();
 			let id_file_map= id_file_map.clone();
-			std::thread::spawn(move||{
-				let (send_queue,cvar)= &*send_queue;
+			move||{
 				loop {
-					let id= {
-						let mut send_queue= send_queue.lock().unwrap();
-						// cvar.wait can fail spuriously, from my understanding, which is
-						// why the waiting must be looped. a bit strange but that's fine.
-						// https://doc.rust-lang.org/std/sync/struct.Condvar.html#method.wait
-						while (*send_queue).len()==0 {
-							send_queue= cvar.wait(send_queue).unwrap();
-						}
-						// got a file to send, remove its id from the queue
-						let id= send_queue[0];
-						send_queue.remove(0);
-						id
-						// drop lock
-					};
+					let id= send_file_rx.recv().unwrap();
 					let id_file_map= id_file_map.lock().unwrap();
 					let path= id_file_map.o.get(&id);
 					if path.is_none() {
@@ -275,16 +257,38 @@ fn open_chat(
 						continue;
 					}
 					// block and send the file
-					// todo: make this interruptable
-					println!("writing to blocking thread");
+					// todo: make this interruptable, probably using tokio
+					println!("writing to blocking stream");
 					std::io::copy(&mut std::fs::File::open(path.unwrap()).unwrap(),&mut blocking_stream).unwrap();
 					println!("finished writing");
 				}
-			})
-		};
+			}
+		});
+		let (recv_file_tx,recv_file_rx)= std::sync::mpsc::channel::<(FileSize,String,glib::Sender<()>)>();
+		let _blocking_read_thread= std::thread::spawn({
+			let profile_dir= profile_dir.clone();
+			move||{
+				loop {
+					std::fs::DirBuilder::new()
+						.recursive(true)
+						.create(format!("{}/downloads",profile_dir)).unwrap();
+					let (size,name,gtk_notifier)= recv_file_rx.recv().unwrap();
+					println!("receiving file from peer");
+					std::io::copy(
+						&mut std::io::Read::take(&mut streams[1],size),
+						&mut std::fs::File::create(
+							format!("{}/downloads/{}",profile_dir,name)
+						).unwrap()
+					).unwrap();
+					println!("file received");
+					gtk_notifier.send(()).unwrap();
+				}
+			}
+		});
 		let (tx,rx)= glib::MainContext::channel(glib::PRIORITY_DEFAULT);
 		{
 			let write_stream= write_stream.clone();
+			let profile_dir= profile_dir.clone();
 			rx.attach(None/*use default context*/,move|msg| {
 				let write_stream= write_stream.clone();
 				use Message::*;
@@ -308,19 +312,62 @@ fn open_chat(
 						let button= gtk::Button::new();
 						button.add(&gtk::Label::new(Some(&format!("download file '{}'",file_name))));
 						button.set_halign(gtk::Align::Start);
-						button.connect_clicked(move|_button| {
-							let mut write_stream= write_stream.lock().unwrap();
-							write_stream.write_all(&bincode::serialize(&Message::FileRequest(file_id)).unwrap()).unwrap();
+						button.connect_clicked({
+							let recv_file_tx= recv_file_tx.clone();
+							let profile_dir= profile_dir.clone();
+							move|button| {
+								let file_name= file_name.clone();
+								let mut write_stream= write_stream.lock().unwrap();
+								write_stream.write_all(&bincode::serialize(&Message::FileRequest(file_id)).unwrap()).unwrap();
+								let row:gtk::ListBoxRow= button.get_parent().unwrap().downcast().unwrap();
+								row.remove(button);
+								let label= gtk::Label::new(Some("downloading file..."));
+								label.set_halign(gtk::Align::Start);
+								label.show();
+								row.add(&label);
+								let (tx,rx)= glib::MainContext::channel(glib::PRIORITY_DEFAULT);
+								{
+									let profile_dir= profile_dir.clone();
+									let file_name= file_name.clone();
+									rx.attach(None/*use default context*/,move|_msg| {
+										match open_image(&format!("{}/downloads/{}",profile_dir,file_name)) {
+											Ok(image)=> {
+												image.show();
+												image.set_halign(gtk::Align::Start);
+												row.remove(&label);
+												row.add(&image);
+											},
+											Err(())=> {
+												label.set_label("file downloaded");
+												let button= gtk::Button::new();
+												button.add(&gtk::Label::new(Some(&format!("copy downloaded file '{}' path",file_name))));
+												{
+													let profile_dir= profile_dir.clone();
+													let file_name= file_name.clone();
+													button.connect_clicked(move|_button| { gtk::Clipboard::get_default(&gdk::DisplayManager::get().get_default_display().unwrap()).unwrap().set_text(&format!(
+														"{}/downloads/{}",
+														profile_dir,
+														file_name,
+													));});
+												}
+												button.show_all();
+												button.set_halign(gtk::Align::Start);
+												row.remove(&label);
+												row.add(&button);
+											}
+										}
+										glib::Continue(false)
+									});
+								}
+								recv_file_tx.send((file_size,file_name,tx)).unwrap();
+							}
 						});
 						button.show_all();
 						messages.add(&button);
 					}
 					FileRequest(id)=> {
 						println!("peer is asking for file <id={}>, sending it",id);
-						let (send_queue,cvar)= &*send_queue;
-						let mut send_queue= send_queue.lock().unwrap();
-						send_queue.push(id);
-						cvar.notify_one();
+						send_file_tx.send(id).unwrap();
 					}
 					//_=> { todo!("got some as-of-yet-unhandled type of message"); }
 				}
@@ -360,8 +407,8 @@ fn open_chat(
 			}).unwrap()).unwrap();
 			id_file_map.o.insert(file_id,file_path);
 		});
-		let image_button:gtk::Button= builder.get_object("send-file-button").unwrap();
-		image_button.connect_clicked(move|_button| {
+		let file_button:gtk::Button= builder.get_object("send-file-button").unwrap();
+		file_button.connect_clicked(move|_button| {
 			println!("image button clicked!");
 			chooser.run();
 		});
@@ -468,14 +515,14 @@ struct Peer {
 fn listen(
 	listener:std::net::TcpListener,
 	thread_pool:GrowingThreadPool,
-	profile_name:std::sync::Arc<String>,
+	profile_dir:std::sync::Arc<String>,
 	tor_connector:TorConnector,
 	nonce_peer_map:std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<Nonce,Peer>>>,
 ) {
 	use std::io::{Read,Write};
 	for stream in listener.incoming() {
 		println!("got listen stream, queueing handle task");
-		let profile_name= profile_name.clone();
+		let profile_dir= profile_dir.clone();
 		// https://docs.rs/rand/0.8.0/rand/rngs/struct.OsRng.html
 		let thread_pool_c= thread_pool.clone();
 		let nonce_peer_map= nonce_peer_map.clone();
@@ -511,7 +558,7 @@ fn listen(
 					open_chat(
 						peer_public_key,
 						streams,
-						profile_name,
+						profile_dir,
 						thread_pool_c,
 					);
 				}
@@ -525,11 +572,11 @@ fn listen(
 					peer.streams[stream_type].replace(stream);
 					if peer.streams.iter().all(Option::is_some) {
 						println!("both streams received, sending peer info to gui thread to open chat");
-						let profile_name= profile_name.clone();
+						let profile_dir= profile_dir.clone();
 						open_chat(
 							peer.public_key,
 							std::convert::TryFrom::try_from(peer.streams.iter().map(|x|x.as_ref().unwrap().try_clone().unwrap()).collect::<Vec<_>>()).unwrap(),
-							profile_name,
+							profile_dir,
 							thread_pool_c,
 						);
 					} else {
@@ -546,11 +593,10 @@ fn open_menu(
 	thread_pool:GrowingThreadPool,
 	tor_child_rc:std::rc::Rc<std::cell::Cell<Option<TorChild>>>,
 ) {
-	let profile_name= std::sync::Arc::new(profile_name);
 	use gtk::prelude::*;
 	// make profile_dir absolute so that tor can use it for a unix socket
 	let cur_dir= std::env::current_dir().unwrap().into_os_string().into_string().unwrap();
-	let profile_dir= format!("{}/{}",cur_dir,profile_name);
+	let profile_dir= std::sync::Arc::new(format!("{}/{}",cur_dir,profile_name));
 	println!("profile_dir is: {}",profile_dir);
 	let onion_key= get_onion_key(&profile_dir);
 	println!("start tor");
@@ -566,7 +612,7 @@ fn open_menu(
 		thread_pool.execute(move||{listen(
 			listener,
 			thread_pool_c,
-			profile_name,
+			profile_dir,
 			tor_connector,
 			nonce_peer_map,
 		)});
@@ -621,6 +667,9 @@ fn main() {
 	// tor_child_rc destructs here, killing tor
 }
 fn get_onion_key(profile_dir:&String)->torut::onion::TorSecretKeyV3 {
+	std::fs::DirBuilder::new()
+		.recursive(true)
+		.create(profile_dir).unwrap();
 	let key_path= format!("{}/key",profile_dir);
 	match std::fs::File::open(&key_path) {
 		Ok(file)=> {
@@ -630,9 +679,6 @@ fn get_onion_key(profile_dir:&String)->torut::onion::TorSecretKeyV3 {
 			torut::onion::TorSecretKeyV3::from(buf)
 		},
 		Err(ref e) if e.kind()==std::io::ErrorKind::NotFound=> {
-			std::fs::DirBuilder::new()
-				.recursive(true)
-				.create(profile_dir.clone()).unwrap();
 			let mut perms= std::fs::metadata(profile_dir.clone()).unwrap().permissions();
 			std::os::unix::fs::PermissionsExt::set_mode(&mut perms,0o700);
 			std::fs::set_permissions(profile_dir.clone(),perms).unwrap();
