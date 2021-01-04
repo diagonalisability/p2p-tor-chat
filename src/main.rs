@@ -310,7 +310,7 @@ fn open_chat(
 							file_size,
 						);
 						let button= gtk::Button::new();
-						button.add(&gtk::Label::new(Some(&format!("download file '{}'",file_name))));
+						button.add(&gtk::Label::new(Some(&format!("download file '{}' of size {}b",file_name,file_size))));
 						button.set_halign(gtk::Align::Start);
 						button.connect_clicked({
 							let recv_file_tx= recv_file_tx.clone();
@@ -337,6 +337,7 @@ fn open_chat(
 												row.remove(&label);
 												row.add(&image);
 											},
+											// not an image
 											Err(())=> {
 												label.set_label("file downloaded");
 												let button= gtk::Button::new();
