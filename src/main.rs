@@ -101,8 +101,9 @@ impl TorChild {
 		println!("getting socks port");
 		let socks_port= loop {
 			let line= lines.next().unwrap().unwrap();
-			if line.contains("Opened Socks listener on") {
-				break line.rsplit(":").next().unwrap().parse().unwrap();
+			println!("{}",line);
+			if line.contains("Socks listener listening on port") {
+				break line.rsplit(" ").next().unwrap().strip_suffix(".").unwrap().parse().unwrap();
 			}
 		};
 		println!("socks port: {}",socks_port);
